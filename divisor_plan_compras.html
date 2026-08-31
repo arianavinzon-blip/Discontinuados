@@ -225,6 +225,20 @@
     margin-top:12px;
   }
   .preview-box h3{font-size:13px; margin:0 0 6px 0;}
+  .col-checks{display:flex; flex-wrap:wrap; gap:8px; margin-top:6px;}
+  .col-check{
+    display:flex; align-items:center; gap:6px;
+    font-size:12.5px;
+    background:var(--accent-soft); color:var(--accent);
+    border:1px solid var(--line); border-radius:6px;
+    padding:5px 9px; cursor:pointer; user-select:none;
+  }
+  .col-check.off{background:#efedea; color:var(--ink-soft); text-decoration:line-through;}
+  .col-check input{margin:0; cursor:pointer;}
+  tr.row-off td{color:var(--ink-soft); text-decoration:line-through; opacity:.7;}
+  tr.row-off td .pill{opacity:.6;}
+  .mini-link{color:var(--accent); cursor:pointer; text-decoration:underline;}
+  .mini-link:hover{filter:brightness(1.1);}
 </style>
 </head>
 <body>
@@ -298,6 +312,28 @@ function rangeStr(top, left, bottom, right){
   return `${numToColLetter(left)}${top}:${numToColLetter(right)}${bottom}`;
 }
 
+// Reescribe las referencias de una fórmula (A1, $A$1, rangos A1:B2) a la nueva
+// ubicación de los datos en el archivo separado. rowMap: fila original -> fila
+// nueva; colMap: columna original -> columna nueva. Así una fórmula como
+// =SUMA(I23:O23), cuya fila 23 pasó a ser la 4, se reescribe como =SUMA(I4:O4).
+// Referencias con hoja explícita (Hoja!A1), nombres de función (LOG10) o que no
+// se pueden mapear se dejan tal cual.
+function remapFormula(formula, rowMap, colMap){
+  if(typeof formula !== "string" || formula === "") return formula;
+  return formula.replace(/(\$?)([A-Za-z]{1,3})(\$?)(\d+)/g, (match, dc, colL, dr, rowD, offset, full) => {
+    const prev = offset > 0 ? full[offset - 1] : "";
+    const next = full[offset + match.length] || "";
+    // No tocar si es parte de un identificador, si tiene hoja explícita (…!A1),
+    // o si va seguido de "(" (nombre de función / rango con nombre).
+    if(/[A-Za-z0-9_.!$]/.test(prev)) return match;
+    if(next === "(") return match;
+    const newCol = colMap[colLetterToNum(colL)];
+    const newRow = rowMap[parseInt(rowD, 10)];
+    if(newCol === undefined || newRow === undefined) return match; // no mapeable -> se deja igual
+    return dc + numToColLetter(newCol) + dr + newRow;
+  });
+}
+
 function App(){
   const [fileName, setFileName] = useState(null);
   const [dragging, setDragging] = useState(false);
@@ -315,6 +351,8 @@ function App(){
   const [prefix, setPrefix] = useState("");
   const [previewName, setPreviewName] = useState("");
   const [previewRows, setPreviewRows] = useState(null);
+  const [excludedCols, setExcludedCols] = useState(() => new Set()); // índices 0-based a NO incluir
+  const [excludedGroups, setExcludedGroups] = useState(() => new Set()); // nombres de grupo a NO generar
   const fileInput = useRef(null);
 
   function reset(){
@@ -322,6 +360,24 @@ function App(){
     setColIndex(null); setRows(null); setGroups(null); setStatus(null);
     setHeaderRowCount(2); setCustomName(""); setPrefix("");
     setPreviewName(""); setPreviewRows(null); setProgress(null);
+    setExcludedCols(new Set());
+    setExcludedGroups(new Set());
+  }
+
+  function toggleColumn(idx){
+    setExcludedCols(prev => {
+      const next = new Set(prev);
+      if(next.has(idx)) next.delete(idx); else next.add(idx);
+      return next;
+    });
+  }
+
+  function toggleGroup(name){
+    setExcludedGroups(prev => {
+      const next = new Set(prev);
+      if(next.has(name)) next.delete(name); else next.add(name);
+      return next;
+    });
   }
 
   // Lee cada celda de una fila como valor plano (solo para detectar y agrupar).
@@ -361,6 +417,7 @@ function App(){
       return;
     }
 
+    setExcludedCols(new Set());
     setReading(true);
     try{
       const buffer = await file.arrayBuffer();
@@ -440,6 +497,7 @@ function App(){
       return;
     }
     setGroups(groupList);
+    setExcludedGroups(new Set());
     setPreviewRows(null);
     setPreviewName("");
     setStatus(null);
@@ -488,13 +546,16 @@ function App(){
   // madre; al separar filas esa madre puede quedar afuera y romper la escritura.
   // Por eso las convertimos en una fórmula normal e independiente (ExcelJS ya la
   // traduce a la posición correcta), conservando la fórmula pero sin la dependencia.
-  function safeCellValue(srcCell){
+  function safeCellValue(srcCell, rowMap, colMap){
     const v = srcCell.value;
     if(v && typeof v === "object" && (v.formula || v.sharedFormula)){
       let formulaText;
       try{ formulaText = srcCell.formula; } catch(e){ formulaText = undefined; }
       if(formulaText){
-        return {formula: formulaText, result: v.result};
+        // Remapeamos las referencias a la nueva ubicación de los datos, para que
+        // p.ej. =SUMA(I23:O23) se reescriba como =SUMA(I4:O4) en el archivo separado.
+        const remapped = (rowMap && colMap) ? remapFormula(formulaText, rowMap, colMap) : formulaText;
+        return {formula: remapped, result: v.result};
       }
       // Si no se pudo recuperar el texto de la fórmula, usamos el valor calculado.
       return v.result !== undefined ? v.result : null;
@@ -505,11 +566,14 @@ function App(){
   // Copia una fila origen en una fila destino, celda por celda, conservando
   // value + style completo (fuente, relleno, bordes, alineación, numFmt) para
   // que fechas, moneda, colores y FÓRMULAS sobrevivan intactos.
-  function copyRowInto(srcRow, destRow, colCount){
-    for(let c = 1; c <= colCount; c++){
-      const srcCell = srcRow.getCell(c);
-      const destCell = destRow.getCell(c);
-      destCell.value = safeCellValue(srcCell); // fórmulas se conservan como fórmula (no compartida)
+  // keptCols: columnas del ORIGEN (1-based) que se conservan, en orden. La
+  // posición en keptCols es la columna destino (1..N), así se recortan las
+  // columnas destildadas y las demás se corren de lugar.
+  function copyRowInto(srcRow, destRow, keptCols, rowMap, colMap){
+    for(let d = 1; d <= keptCols.length; d++){
+      const srcCell = srcRow.getCell(keptCols[d - 1]);
+      const destCell = destRow.getCell(d);
+      destCell.value = safeCellValue(srcCell, rowMap, colMap); // fórmula conservada y con referencias remapeadas
       destCell.style = srcCell.style;
     }
     if(srcRow.height) destRow.height = srcRow.height;
@@ -530,8 +594,19 @@ function App(){
 
   async function generate(){
     if(!rows || colIndex === null || !groups || !workbook) return;
+    const totalCols = workbook.worksheets[0].columnCount;
+    if(excludedCols.size >= totalCols){
+      setStatus({type: 'err', msg: 'Sacaste todas las columnas. Dejá tildada al menos una para poder generar los archivos.'});
+      return;
+    }
+    // Solo los grupos que quedaron tildados.
+    const groupsToGen = groups.filter(g => !excludedGroups.has(g.name));
+    if(groupsToGen.length === 0){
+      setStatus({type: 'err', msg: 'Destildaste todos los grupos. Dejá tildado al menos uno para poder generar los archivos.'});
+      return;
+    }
     setBusy(true);
-    setProgress({done: 0, total: groups.length});
+    setProgress({done: 0, total: groupsToGen.length});
     setStatus({type: 'info', msg: 'Generando archivos...'});
     try{
       const zip = new JSZip();
@@ -539,6 +614,31 @@ function App(){
       const colCount = originalWs.columnCount;
       const baseName = fileName.replace(/\.xlsx$/i, '');
       const cleanPrefix = sanitizeForFilename(prefix);
+
+      // Columnas del ORIGEN (1-based) que se conservan, en orden, según los
+      // checkboxes. colMap: columna original -> columna nueva (para anchos y merges).
+      const keptCols = [];
+      const colMap = {};
+      for(let c = 1; c <= colCount; c++){
+        if(!excludedCols.has(c - 1)){
+          keptCols.push(c);
+          colMap[c] = keptCols.length;
+        }
+      }
+
+      // Dado un rango de columnas del original, devuelve el rango destino de las
+      // que se conservan (o null si ninguna quedó). Las columnas conservadas
+      // dentro de un rango son contiguas en el destino, así que basta min/max.
+      function mapMergeCols(left, right){
+        let lo = null, hi = null;
+        for(let c = left; c <= right; c++){
+          if(colMap[c] !== undefined){
+            if(lo === null) lo = colMap[c];
+            hi = colMap[c];
+          }
+        }
+        return lo === null ? null : {lo, hi};
+      }
 
       // Celdas combinadas del archivo original, ya parseadas.
       let originalMerges = [];
@@ -550,44 +650,52 @@ function App(){
         console.warn('No pude leer las celdas combinadas del original:', mErr);
       }
 
-      for(let gi = 0; gi < groups.length; gi++){
-        const g = groups[gi];
+      for(let gi = 0; gi < groupsToGen.length; gi++){
+        const g = groupsToGen[gi];
         const newWb = new ExcelJS.Workbook();
         const newWs = newWb.addWorksheet(sanitizeSheetName(sheetName));
 
-        // Conservar anchos de columna (protegido ante columnas sin definir).
+        // Conservar anchos, solo de las columnas que quedan (protegido ante columnas sin definir).
         try{
-          newWs.columns = (originalWs.columns || []).map(col => ({width: col && col.width ? col.width : undefined}));
+          newWs.columns = keptCols.map(c => {
+            const col = originalWs.getColumn(c);
+            return {width: col && col.width ? col.width : undefined};
+          });
         } catch(colErr){
           console.warn('No pude copiar los anchos de columna:', colErr);
         }
 
-        // rowMap: fila original -> fila nueva (para remapear celdas combinadas).
+        // rowMap: fila original -> fila nueva (para remapear celdas combinadas
+        // y referencias de fórmulas). Lo armamos COMPLETO antes de copiar, porque
+        // una fórmula puede referenciar filas que se copian más abajo.
         const rowMap = {};
-
-        // Copiar filas de encabezado tal cual.
+        const srcRowsInOrder = [];
+        // Encabezado.
         for(let r = 1; r <= headerRowCount; r++){
-          copyRowInto(originalWs.getRow(r), newWs.getRow(r), colCount);
-          rowMap[r] = r;
+          rowMap[r] = srcRowsInOrder.length + 1;
+          srcRowsInOrder.push(r);
         }
-
-        // Copiar las filas de datos que coinciden con este grupo.
-        let destRowNum = headerRowCount + 1;
+        // Filas de datos que coinciden con este grupo.
         for(let r = headerRowCount + 1; r <= originalWs.rowCount; r++){
           const val = displayValue(rows[r - 1][colIndex]).trim();
           if(val === g.name){
-            copyRowInto(originalWs.getRow(r), newWs.getRow(destRowNum), colCount);
-            rowMap[r] = destRowNum;
-            destRowNum++;
+            rowMap[r] = srcRowsInOrder.length + 1;
+            srcRowsInOrder.push(r);
           }
         }
+        // Ahora sí copiamos, con el rowMap/colMap ya completos.
+        srcRowsInOrder.forEach((srcR, i) => {
+          copyRowInto(originalWs.getRow(srcR), newWs.getRow(i + 1), keptCols, rowMap, colMap);
+        });
 
-        // Reaplicar celdas combinadas.
+        // Reaplicar celdas combinadas (remapeando filas y columnas conservadas).
         for(const m of originalMerges){
           try{
+            const cols = mapMergeCols(m.left, m.right);
+            if(!cols) continue; // el merge caía entero en columnas quitadas
             if(m.bottom <= headerRowCount){
-              // Merge dentro del encabezado: misma posición.
-              newWs.mergeCells(rangeStr(m.top, m.left, m.bottom, m.right));
+              // Merge dentro del encabezado: filas iguales, columnas remapeadas.
+              newWs.mergeCells(rangeStr(m.top, cols.lo, m.bottom, cols.hi));
             } else if(m.top > headerRowCount){
               // Merge dentro de los datos: solo si todas sus filas quedaron
               // en este grupo y siguen contiguas en el archivo nuevo.
@@ -595,7 +703,7 @@ function App(){
               const newBottom = rowMap[m.bottom];
               if(newTop !== undefined && newBottom !== undefined &&
                  (newBottom - newTop) === (m.bottom - m.top)){
-                newWs.mergeCells(rangeStr(newTop, m.left, newBottom, m.right));
+                newWs.mergeCells(rangeStr(newTop, cols.lo, newBottom, cols.hi));
               }
             }
             // Los merges que cruzan encabezado y datos se omiten (caso muy raro).
@@ -610,7 +718,7 @@ function App(){
         const outName = (cleanPrefix ? cleanPrefix + '_' : '') + baseName + '_' + namePart + '.xlsx';
         zip.file(outName, buf);
 
-        setProgress({done: gi + 1, total: groups.length});
+        setProgress({done: gi + 1, total: groupsToGen.length});
         // Cedemos el hilo para que la barra de progreso se actualice en pantalla.
         await new Promise(res => setTimeout(res, 0));
       }
@@ -625,7 +733,7 @@ function App(){
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
-      setStatus({type: 'ok', msg: `Listo. Se generaron ${groups.length} archivos, uno por cada valor de la columna, con el formato original. Se descargaron juntos en “${zipName}”.`});
+      setStatus({type: 'ok', msg: `Listo. Se generaron ${groupsToGen.length} archivos, uno por cada valor de la columna, con el formato original. Se descargaron juntos en “${zipName}”.`});
     } catch(err){
       console.error(err);
       const detalle = err && err.message ? err.message : String(err);
@@ -638,6 +746,7 @@ function App(){
 
   const headerCandidates = rows ? (rows[headerRowCount - 1] || []) : [];
   const isLarge = rows ? (rows.length - headerRowCount) >= LARGE_FILE_THRESHOLD : false;
+  const includedGroupCount = groups ? groups.filter(g => !excludedGroups.has(g.name)).length : 0;
 
   return (
     <div>
@@ -737,20 +846,57 @@ function App(){
 
           {groups && (
             <>
+              <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', marginTop:'4px'}}>
+                <span className="fg-label" style={{margin:0}}>Grupos a generar (destildá los que no querés, ej: totales)</span>
+                <span style={{fontSize:'12px'}}>
+                  <span className="mini-link" onClick={()=>setExcludedGroups(new Set())}>Todos</span>
+                  <span style={{color:'var(--line)'}}> · </span>
+                  <span className="mini-link" onClick={()=>setExcludedGroups(new Set(groups.map(g=>g.name)))}>Ninguno</span>
+                </span>
+              </div>
               <div className="table-scroll">
                 <table>
                   <thead>
-                    <tr><th>Valor</th><th>Filas</th></tr>
+                    <tr><th style={{width:'34px'}}></th><th>Valor</th><th>Filas</th></tr>
                   </thead>
                   <tbody>
                     {groups.map(g => (
-                      <tr key={g.name}>
+                      <tr key={g.name} className={excludedGroups.has(g.name) ? 'row-off' : ''}>
+                        <td style={{textAlign:'center'}}>
+                          <input
+                            type="checkbox"
+                            checked={!excludedGroups.has(g.name)}
+                            onChange={()=>toggleGroup(g.name)}
+                          />
+                        </td>
                         <td>{g.name}</td>
                         <td><span className="pill">{g.count}</span></td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
+              </div>
+
+              <div className="field-group" style={{marginTop:'12px'}}>
+                <label className="fg-label">Columnas a incluir en los archivos</label>
+                <div className="col-checks">
+                  {headerCandidates.map((h, idx) => (
+                    <label key={idx} className={"col-check" + (excludedCols.has(idx) ? " off" : "")}>
+                      <input
+                        type="checkbox"
+                        checked={!excludedCols.has(idx)}
+                        onChange={()=>toggleColumn(idx)}
+                      />
+                      <span>{displayValue(h) || `Columna ${idx+1}`}</span>
+                    </label>
+                  ))}
+                </div>
+                <div className="fg-hint">Destildá una columna para que <strong>no</strong> aparezca en los archivos generados. Se aplica a todos los archivos. La agrupación por país/compañía se hace igual, aunque destildes esa columna.</div>
+                {excludedCols.size > 0 && (
+                  <div className="fg-hint" style={{color:'var(--warn)'}}>
+                    Ojo: si una columna que dejás usa una fórmula que apunta a una columna que sacaste, esa fórmula puede quedar rota (#REF!). Conviene revisar con “Ver detalle”.
+                  </div>
+                )}
               </div>
 
               <div className="field-group" style={{marginTop:'12px'}}>
@@ -769,6 +915,7 @@ function App(){
                       <thead>
                         <tr>
                           {headerCandidates.map((h, idx) => (
+                            excludedCols.has(idx) ? null :
                             <th key={idx}>{displayValue(h) || `Col ${idx+1}`}</th>
                           ))}
                         </tr>
@@ -777,6 +924,7 @@ function App(){
                         {previewRows.map((r, ri) => (
                           <tr key={ri}>
                             {headerCandidates.map((h, ci) => (
+                              excludedCols.has(ci) ? null :
                               <td key={ci}>{displayValue(r[ci])}</td>
                             ))}
                           </tr>
@@ -787,8 +935,12 @@ function App(){
                 </div>
               )}
 
-              <button className="primary" disabled={busy} onClick={generate}>
-                {busy ? "Generando..." : `Generar ${groups.length} archivos (.zip)`}
+              <button
+                className="primary"
+                disabled={busy || (headerCandidates.length > 0 && excludedCols.size >= headerCandidates.length) || includedGroupCount === 0}
+                onClick={generate}
+              >
+                {busy ? "Generando..." : `Generar ${includedGroupCount} archivo${includedGroupCount === 1 ? '' : 's'} (.zip)`}
               </button>
             </>
           )}
