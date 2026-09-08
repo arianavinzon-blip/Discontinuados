@@ -353,6 +353,8 @@ function App(){
   const [previewRows, setPreviewRows] = useState(null);
   const [excludedCols, setExcludedCols] = useState(() => new Set()); // índices 0-based a NO incluir
   const [excludedGroups, setExcludedGroups] = useState(() => new Set()); // nombres de grupo a NO generar
+  const [sheetIndex, setSheetIndex] = useState(0); // hoja del libro que se está dividiendo
+  const [sheetList, setSheetList] = useState([]);  // [{name, state}] de todas las hojas
   const fileInput = useRef(null);
 
   function reset(){
@@ -362,6 +364,7 @@ function App(){
     setPreviewName(""); setPreviewRows(null); setProgress(null);
     setExcludedCols(new Set());
     setExcludedGroups(new Set());
+    setSheetIndex(0); setSheetList([]);
   }
 
   function toggleColumn(idx){
@@ -406,6 +409,48 @@ function App(){
     return {headerRowIdx: null, col: null};
   }
 
+  // Lee una hoja concreta del libro: arma las filas, detecta encabezado y columna
+  // y calcula los grupos. Se usa al abrir el archivo y al cambiar de hoja.
+  function loadSheet(wb, idx){
+    setSheetIndex(idx);
+    setExcludedCols(new Set());
+    const ws = wb.worksheets[idx];
+    if(!ws){
+      setSheetName(null); setRows(null); setGroups(null); setColIndex(null);
+      setStatus({type: 'err', msg: 'Esa hoja no tiene datos.'});
+      return;
+    }
+    setSheetName(ws.name);
+    const colCount = ws.columnCount;
+    const rowCount = ws.rowCount;
+    if(!colCount || !rowCount || rowCount === 0){
+      setRows(null); setGroups(null); setColIndex(null);
+      setStatus({type: 'err', msg: 'Esa hoja está vacía: no encontré ni encabezados ni filas de datos. Probá con otra hoja.'});
+      return;
+    }
+    const allRows = [];
+    for(let r = 1; r <= rowCount; r++){
+      allRows.push(rowValues(ws.getRow(r), colCount));
+    }
+    setRows(allRows);
+    const {headerRowIdx, col} = detectHeaderAndColumn(allRows, "");
+    const effHeaderRows = headerRowIdx !== null ? headerRowIdx + 1 : 2;
+    setHeaderRowCount(effHeaderRows);
+    if(col !== null){
+      setColIndex(col);
+      computeGroups(allRows, effHeaderRows, col);
+    } else {
+      setColIndex(null);
+      setGroups(null);
+      setStatus({type: 'err', msg: 'No pude detectar automáticamente la columna de país/compañía en esta hoja. Revisá la fila de encabezado y elegí la columna a mano en la lista.'});
+    }
+  }
+
+  function onSheetChange(newIdx){
+    setPreviewRows(null); setPreviewName("");
+    loadSheet(workbook, Number(newIdx));
+  }
+
   async function handleFile(file){
     if(!file) return;
     setStatus(null);
@@ -430,42 +475,20 @@ function App(){
         return;
       }
 
-      const ws = wb.worksheets[0];
-      if(!ws){
+      if(!wb.worksheets || wb.worksheets.length === 0){
         setStatus({type: 'err', msg: 'El archivo no tiene ninguna hoja con datos.'});
         return;
       }
 
-      const colCount = ws.columnCount;
-      const rowCount = ws.rowCount;
-      if(!colCount || !rowCount || rowCount === 0){
-        setStatus({type: 'err', msg: 'El archivo está vacío: no encontré ni encabezados ni filas de datos.'});
-        return;
-      }
-
-      const allRows = [];
-      for(let r = 1; r <= rowCount; r++){
-        allRows.push(rowValues(ws.getRow(r), colCount));
-      }
-
-      const {headerRowIdx, col} = detectHeaderAndColumn(allRows, "");
-
       setWorkbook(wb);
-      setSheetName(ws.name);
-      setRows(allRows);
       setFileName(file.name);
+      setSheetList(wb.worksheets.map(s => ({name: s.name, state: s.state})));
 
-      const effHeaderRows = headerRowIdx !== null ? headerRowIdx + 1 : 2;
-      setHeaderRowCount(effHeaderRows);
-
-      if(col !== null){
-        setColIndex(col);
-        computeGroups(allRows, effHeaderRows, col);
-      } else {
-        setColIndex(null);
-        setGroups(null);
-        setStatus({type: 'err', msg: 'No pude detectar automáticamente la columna de país/compañía. Revisá abajo la fila de encabezado y elegí la columna a mano en la lista.'});
-      }
+      // Por defecto tomamos la primera hoja VISIBLE (la que la persona ve y usa),
+      // no worksheets[0], que puede ser una hoja oculta con datos viejos.
+      let defIdx = wb.worksheets.findIndex(s => s.state !== 'hidden' && s.state !== 'veryHidden');
+      if(defIdx < 0) defIdx = 0;
+      loadSheet(wb, defIdx);
     } catch(err){
       console.error(err);
       setStatus({type: 'err', msg: 'No pude leer el archivo. Verificá que sea un .xlsx válido.'});
@@ -594,7 +617,7 @@ function App(){
 
   async function generate(){
     if(!rows || colIndex === null || !groups || !workbook) return;
-    const totalCols = workbook.worksheets[0].columnCount;
+    const totalCols = workbook.worksheets[sheetIndex].columnCount;
     if(excludedCols.size >= totalCols){
       setStatus({type: 'err', msg: 'Sacaste todas las columnas. Dejá tildada al menos una para poder generar los archivos.'});
       return;
@@ -610,7 +633,7 @@ function App(){
     setStatus({type: 'info', msg: 'Generando archivos...'});
     try{
       const zip = new JSZip();
-      const originalWs = workbook.worksheets[0];
+      const originalWs = workbook.worksheets[sheetIndex];
       const colCount = originalWs.columnCount;
       const baseName = fileName.replace(/\.xlsx$/i, '');
       const cleanPrefix = sanitizeForFilename(prefix);
@@ -790,6 +813,22 @@ function App(){
       {fileName && (
         <div className="panel">
           <h2>📄 {fileName}</h2>
+
+          {sheetList.length > 1 && (
+            <>
+              <div className="row">
+                <span className="row-label">Hoja del Excel a dividir</span>
+                <select value={sheetIndex} onChange={(e)=>onSheetChange(e.target.value)}>
+                  {sheetList.map((s, i) => (
+                    <option key={i} value={i}>
+                      {s.name}{(s.state === 'hidden' || s.state === 'veryHidden') ? '  (oculta)' : ''}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="info-box">Este Excel tiene varias hojas. Reviso por defecto la primera <strong>visible</strong>; si querés dividir otra, elegila arriba.</div>
+            </>
+          )}
 
           <div className="row">
             <span className="row-label">Filas de encabezado</span>
